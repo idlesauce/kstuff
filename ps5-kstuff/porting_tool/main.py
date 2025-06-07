@@ -5,7 +5,7 @@ if 'linux' not in sys.platform:
     input('Press Enter to exit')
     exit(1)
 elif len(sys.argv) not in (3, 4, 5):
-    print('usage: main.py <database> <ps5 ip> [port for payload loader] [kernel data dump]')
+    print('usage: main.py <offsets database> <ps5 ip> [port for payload loader] [kernel data dump]')
     exit(0)
 
 import gdb_rpc, traces
@@ -80,31 +80,47 @@ def dump_kernel():
     gdb.eval('offsets.allproc = '+ostr(kdata_base + symbols['allproc']))
     if not gdb.ieval('rpipe'): gdb.eval('r0gdb_init_with_offsets()')
     local_buf = bytearray()
-    with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping kdata') as addr:
-        remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
-        remote_buf = gdb.ieval('malloc(1048576)')
-        one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
-        total_sent = 0
-        while total_sent < (134 << 20):
-            chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kdata_base+total_sent, min(1048576, (134 << 20) - total_sent)))
-            if chk0 <= 0: break
-            assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
-            total_sent += chk0
-            #offset = 0
-            #while offset < chk0:
-            #    chk = gdb.ieval('(int)write(%d, %d, %d)'%(remote_fd, remote_buf+offset, chk0-offset))
-            #    assert chk > 0
-            #    offset += chk
-            #    total_sent += chk
-        # this loop is to detect panics while dumping
-        while len(local_buf) != total_sent:
-            gdb.eval('(int)nanosleep(%d)'%one_second)
-        gdb.eval('(int)close(%d)'%remote_fd)
+
+    timeout = 10 # if no data is received for this many seconds, assume the PS5 paniced
+    max_dump_size_bytes = 250 * 1024 * 1024 # 250 MB - you can set this if you know the size of readable memory from kdata_base and avoid a panic
+    # we currently have the wrong text size/kernel .data base thats passed in to us
+    # reading the first 0x10000 bytes on higher firmwares causes a panic, so skip that,
+    # theres nothing there on lower firmwares anyway, that was .hv and empty
+    bytes_to_skip_from_start = 0x10000 
+    buffer_size = 1 * 1024 * 1024
+
+    total_sent = bytes_to_skip_from_start
+    if bytes_to_skip_from_start > 0:
+        local_buf.extend(b'\0' * bytes_to_skip_from_start)
+
+    try:
+        with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping kdata', timeout) as addr:
+            remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
+            remote_buf = gdb.ieval('malloc(%d)'%buffer_size)
+
+            while total_sent < (max_dump_size_bytes):
+                chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kdata_base+total_sent, min(buffer_size, (max_dump_size_bytes) - total_sent)))
+                if chk0 <= 0: break
+                assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
+                total_sent += chk0
+
+            gdb.ieval('free(%d)'%remote_buf)
+            gdb.ieval('close(%d)'%remote_fd)
+    except (gdb_rpc.DisconnectedException, TimeoutError):
+        # assume it paniced = read everything
+        pass
+
+    if total_sent == bytes_to_skip_from_start:
+        print("Failed to read kernel data, if the ps5 paniced then you may need to increase bytes_to_skip_from_start")
+        exit(1)
+
+    print("Done dumping, got 0x%x bytes. Saving to file..."%len(local_buf))
     if len(sys.argv) == 5:
         with open(sys.argv[4], 'wb') as file:
             file.write(kdata_base.to_bytes(8, 'little'))
             file.write(len(local_buf).to_bytes(8, 'little'))
             file.write(local_buf)
+
     return bytes(local_buf), kdata_base
 
 def get_kernel(_cache=[]):
@@ -168,22 +184,43 @@ def tss_array():
     return tss_array[0] - kdata_base
 
 # XXX: relies on in-structure offsets, is it ok?
-@derive_symbol
-@retry_on_error
+@derive_symbols('pcpu_array', 'pcpu_structsize')
 def pcpu_array():
-    kernel, kdata_base = get_kernel()
-    planes = [b''.join(kernel[j+0x34:j+0x38]+kernel[j+0x730:j+0x738] for j in range(i, len(kernel), 0x900)) for i in range(0, 0x900, 4)]
-    needle = b''.join(i.to_bytes(4, 'little')*3 for i in range(16))
-    indices = [i.find(needle) for i in planes]
-    unique_indices = set(indices)
-    assert len(unique_indices) == 2 and -1 in unique_indices
-    unique_indices.discard(-1)
-    i = unique_indices.pop()
-    j = indices.index(i)
-    indices[j] = -1
-    assert set(indices) == {-1}
-    assert planes[j].find(needle, i+1) < 0
-    return (i // 12) * 0x900 + j * 4
+    kernel, _ = get_kernel()
+    
+    min_structsize = 0x800
+    max_structsize = 0x1100
+
+    cpu_index_offset = 0x34
+    cpu_count = 16
+
+    assert min_structsize % 0x10 == 0
+
+    # find a structure that has a number incrementing from 0 to cpu_count every structsize bytes at offset cpu_index_offset
+    for startindex in range(min_structsize, len(kernel), 0x10):
+        # early out - go backwards, cpu_count will have less false positives than 0
+        if kernel[startindex + cpu_index_offset:startindex + cpu_index_offset + 4] != (cpu_count - 1).to_bytes(4, 'little'):
+            continue
+
+        for structsize in range(min_structsize, max_structsize, 0x8):
+            presumed_pcpu_array_start = startindex - structsize * (cpu_count-1)
+            
+            if presumed_pcpu_array_start < 0:
+                continue
+
+            valid = True
+            for i in range(0, cpu_count):
+                entry_offset = presumed_pcpu_array_start + (i * structsize)
+                entry_cpu_index = int.from_bytes(kernel[entry_offset + cpu_index_offset:entry_offset + cpu_index_offset + 4], 'little')
+                if entry_cpu_index != i:
+                    valid = False
+                    break
+
+            if valid:
+                return presumed_pcpu_array_start, structsize 
+            
+    raise Exception("Failed to find pcpu_array")
+
 
 def get_string_xref(name, offset):
     kernel, kdata_base = get_kernel()

@@ -198,10 +198,14 @@ class GDB:
         self.stdio = None
 
 class SocketWorker:
-    def __init__(self, gdb, data, title):
+    def __init__(self, gdb, data, title, timeout=None):
         self.data = self.prepare(data)
         self.sock, (self.host, self.port) = gdb.bind_socket()
         self.title = title
+        self.timeout = timeout
+        if self.timeout is not None:
+            self.sock.settimeout(self.timeout)
+
     def __enter__(self):
         self.sock.__enter__()
         self.thr = threading.Thread(target=self.run, daemon=True)
@@ -223,6 +227,8 @@ class SocketWorker:
         ...
     def run(self):
         with self.sock.accept()[0] as sock:
+            if self.timeout is not None:
+                sock.settimeout(self.timeout)
             total = 0
             while True:
                 q = self.op(sock)
