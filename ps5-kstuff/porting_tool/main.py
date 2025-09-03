@@ -62,6 +62,15 @@ def retry_on_error(f):
             return ans
     return f1
 
+def optional(f):
+    @functools.wraps(f)
+    def f1(*args):
+        try: return f(*args)
+        except:
+            print('\nskipping optional %s due to error'%f.__name__)
+            return 0
+    return f1
+
 derivations = []
 
 def derive_symbol(f):
@@ -86,26 +95,37 @@ def dump_kernel():
     gdb.eval('offsets.allproc = '+ostr(kdata_base + get_symbol('allproc')))
     if not gdb.ieval('rpipe'): gdb.eval('r0gdb_init_with_offsets()')
     local_buf = bytearray()
-    with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping kdata') as addr:
-        remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
-        remote_buf = gdb.ieval('malloc(1048576)')
-        one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
-        total_sent = 0
-        while total_sent < (134 << 20):
-            chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kdata_base+total_sent, min(1048576, (134 << 20) - total_sent)))
-            if chk0 <= 0: break
-            assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
-            total_sent += chk0
-            #offset = 0
-            #while offset < chk0:
-            #    chk = gdb.ieval('(int)write(%d, %d, %d)'%(remote_fd, remote_buf+offset, chk0-offset))
-            #    assert chk > 0
-            #    offset += chk
-            #    total_sent += chk
-        # this loop is to detect panics while dumping
-        while len(local_buf) != total_sent:
-            gdb.eval('(int)nanosleep(%d)'%one_second)
-        gdb.eval('(int)close(%d)'%remote_fd)
+    
+    timeout = 10 # if no data is received for this many seconds, assume the PS5 paniced
+    max_dump_size_bytes = 250 * 1024 * 1024 # 250 MB - you can set this if you know the size of readable memory from kdata_base and avoid a panic
+    bytes_to_skip_from_start = 0 
+    buffer_size = 1 * 1024 * 1024
+
+    total_sent = bytes_to_skip_from_start
+    if bytes_to_skip_from_start > 0:
+        local_buf.extend(b'\0' * bytes_to_skip_from_start)
+
+    try:
+        with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping kdata', timeout) as addr:
+            remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
+            remote_buf = gdb.ieval('malloc(%d)'%buffer_size)
+
+            while total_sent < (max_dump_size_bytes):
+                chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kdata_base+total_sent, min(buffer_size, (max_dump_size_bytes) - total_sent)))
+                if chk0 <= 0: break
+                assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
+                total_sent += chk0
+
+            gdb.ieval('(int)close(%d)'%remote_fd)
+    except (gdb_rpc.DisconnectedException, TimeoutError):
+        # assume it paniced = read everything
+        pass
+
+    if total_sent == bytes_to_skip_from_start:
+        print("Failed to read kernel data, if the ps5 paniced then you may have the incorrect kdata base, increase bytes_to_skip_from_start")
+        exit(1)
+
+    print("Done dumping, got 0x%x bytes. Saving to file..."%len(local_buf))
     if len(sys.argv) == 5:
         with open(sys.argv[4], 'wb') as file:
             file.write(kdata_base.to_bytes(8, 'little'))
@@ -174,22 +194,44 @@ def tss_array():
     return tss_array[0] - kdata_base
 
 # XXX: relies on in-structure offsets, is it ok?
-@derive_symbol
+@derive_symbols('pcpu_array', 'pcpu_structsize')
 @retry_on_error
 def pcpu_array():
-    kernel, kdata_base = get_kernel()
-    planes = [b''.join(kernel[j+0x34:j+0x38]+kernel[j+0x730:j+0x738] for j in range(i, len(kernel), 0x900)) for i in range(0, 0x900, 4)]
-    needle = b''.join(i.to_bytes(4, 'little')*3 for i in range(16))
-    indices = [i.find(needle) for i in planes]
-    unique_indices = set(indices)
-    assert len(unique_indices) == 2 and -1 in unique_indices
-    unique_indices.discard(-1)
-    i = unique_indices.pop()
-    j = indices.index(i)
-    indices[j] = -1
-    assert set(indices) == {-1}
-    assert planes[j].find(needle, i+1) < 0
-    return (i // 12) * 0x900 + j * 4
+    kernel, _ = get_kernel()
+    
+    min_structsize = 0x800
+    max_structsize = 0x1100
+
+    cpu_index_offset = 0x34
+    cpu_count = 16
+
+    assert min_structsize % 0x10 == 0
+
+    # find a structure that has a number incrementing from 0 to cpu_count every structsize bytes at offset cpu_index_offset
+    for startindex in range(min_structsize, len(kernel), 0x10):
+        # early out - go backwards, cpu_count will have less false positives than 0
+        if kernel[startindex + cpu_index_offset:startindex + cpu_index_offset + 4] != (cpu_count - 1).to_bytes(4, 'little'):
+            continue
+
+        for structsize in range(min_structsize, max_structsize, 0x8):
+            presumed_pcpu_array_start = startindex - structsize * (cpu_count-1)
+            
+            if presumed_pcpu_array_start < 0:
+                continue
+
+            valid = True
+            for i in range(0, cpu_count):
+                entry_offset = presumed_pcpu_array_start + (i * structsize)
+                entry_cpu_index = int.from_bytes(kernel[entry_offset + cpu_index_offset:entry_offset + cpu_index_offset + 4], 'little')
+                if entry_cpu_index != i:
+                    valid = False
+                    break
+
+            if valid:
+                return presumed_pcpu_array_start, structsize 
+            
+    raise Exception("Failed to find pcpu_array")
+
 
 def get_string_xref(name, offset):
     kernel, kdata_base = get_kernel()
@@ -302,6 +344,60 @@ def virt2phys(virt, phys, addr):
     #print('->', hex(ans))
     return ans
 
+def get_cur_proc_pmap():
+    kdata_base = gdb.ieval('kdata_base')
+    gdb.eval('offsets.allproc = '+ostr(kdata_base + get_symbol('allproc')))
+    if not gdb.ieval('rpipe'): gdb.eval('r0gdb_init_with_offsets()')
+    thread = gdb.ieval('get_thread()')
+    proc = gdb.ieval('{void*}(%d)'%(thread+8))
+    # if this breaks its probably because of this hard coded 0x200
+    # check KERNEL_OFFSET_PROC_P_VMSPACE in https://github.com/ps5-payload-dev/sdk/blob/master/crt/kernel.c to see if it changed
+    vmspace = gdb.ieval('{void*}%d'%(proc+0x200))
+    # make sure its a kernel ptr
+    assert vmspace > 0xFFFF800000000000 and vmspace < 0xFFFFFFFFFFFFFFFF
+
+    # https://github.com/cheburek3000/meme_dumper/blob/main/source/main.c#L80, guess_kernel_pmap_store_offset
+    def find_pmap(buf):
+        needle = (0x1430000 | (4 << 128)).to_bytes(24, 'little')
+        i = 0
+        while True:
+            i = buf.find(needle, i)
+            if i < 0: break
+            if any(buf[i+24:i+32]) and buf[i+24:i+28] == buf[i+32:i+36] and not any(buf[i+36:i+40]):
+                return i - 8
+            i += 1
+        return None
+
+    def copy_from_kernel(kaddr, size):
+        local_buf = bytearray()
+        with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping from kernel') as addr:
+            remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
+            remote_buf = gdb.ieval('malloc(%d)'%(size))
+            total_sent = 0
+
+            while total_sent < (size):
+                chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kaddr, size - total_sent))
+                if chk0 <= 0: break
+                assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
+                total_sent += chk0
+
+            gdb.ieval('(int)close(%d)'%remote_fd)
+            # malloc here is just a wrapper around mmap
+            gdb.ieval('(int)munmap(%d, %d)'%(remote_buf, size))
+        return local_buf
+    
+    remaining_page_bytes_size = (0x1000 - (vmspace % 0x1000))
+    buf = copy_from_kernel(vmspace, remaining_page_bytes_size)
+    pmap_offs = find_pmap(buf)
+    if pmap_offs is None:
+        # try next page, in case the vmspace spans 2 pages
+        buf += copy_from_kernel(vmspace+remaining_page_bytes_size, 0x1000)
+        pmap_offs = find_pmap(buf)
+
+    assert pmap_offs is not None, "couldn't find pmap for current process"
+
+    return vmspace + pmap_offs
+
 @derive_symbol
 @retry_on_error
 def doreti_iret():
@@ -318,9 +414,9 @@ def doreti_iret():
         gdb.ieval('{void*}%d = %d'%(tss+0x1c+4*8, buf))
     gdb.ieval('{char}%d = 0'%(idt+1*16+4))
     gdb.ieval('{char}%d = 4'%(idt+13*16+4))
-    ptr = gdb.ieval('{void*}({void*}(get_thread()+8)+0x200)+0x300')
-    virt = gdb.ieval('{void*}%d'%ptr)
-    phys = gdb.ieval('{void*}%d'%(ptr+8))
+    pmap = get_cur_proc_pmap()
+    virt = gdb.ieval('{void*}%d'%(pmap+32))
+    phys = gdb.ieval('{void*}%d'%(pmap+40))
     buf_phys = virt2phys(virt, phys, buf)
     pages = set()
     while True:
@@ -715,12 +811,14 @@ def syscall_before():
         idx_syscall_before -= 1
     return trace[idx_syscall_before].rip - kdata_base, trace[idx_syscall_after].rip - kdata_base
 
-@derive_symbols('mov_rdi_cr3')
+@derive_symbols('mov_x_cr3', 'mov_x_cr3_reg_tf_offset')
 @retry_on_error
-def mov_rdi_cr3():
+def mov_x_cr3():
     use_r0gdb_raw(do_r0gdb=False)
     kdata_base = gdb.ieval('kdata_base')
     thread = gdb.ieval('get_thread()')
+    pmap = get_cur_proc_pmap()
+    cr3 = gdb.ieval('{void*}%d'%(pmap+40))
     use_r0gdb_raw(do_r0gdb=True)
     gdb.ieval('$pc = '+ostr(kdata_base+get_symbol('pmap_activate_sw')))
     gdb.ieval('$rdi = '+ostr(thread))
@@ -729,13 +827,30 @@ def mov_rdi_cr3():
         gdb.execute('stepi')
         print(hex(gdb.ieval('$pc')))
     step()
-    while gdb.ieval('(void*)$rdi') == thread:
+
+    winner_tf_offset = None
+    winner_pc = None
+    regs_in_trapframe_order = ('rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9', 'rax', 'rbx', 'rbp', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
+    def get_all_regs():
+        return [(reg, gdb.ieval('$'+reg)) for reg in regs_in_trapframe_order]
+    while True:
+        # check which register holds the cr3 value if any
+        regs = get_all_regs()
+        found = False
+        for i, (reg, value) in enumerate(regs):
+            if value == cr3:
+                print('found cr3 in', reg)
+                found = True
+                winner_tf_offset = i * 8
+                winner_pc = pc
+                break
+        if found:
+            break
+    
         gdb.ieval('$eflags = 0x102')
         pc = gdb.ieval('$pc')
         step()
-    mov_rdi_cr3 = pc
-    assert gdb.ieval('$pc') - mov_rdi_cr3 == 3
-    return mov_rdi_cr3 - kdata_base
+    return winner_pc - kdata_base, winner_tf_offset
     # the rest of the code is kept for reference. there's a better mov cr3, rax gadget in resumectx
     cr3 = gdb.ieval('(void*)$rdi')
     assert cr3 < 2**39 and not cr3 % 4096
@@ -898,7 +1013,7 @@ def find_file_string(tail):
     return q
 
 @derive_symbol
-@retry_on_error
+@optional
 def mmap_self_fix_2_start():
     use_r0gdb_trace(16777216)
     kdata_base = gdb.ieval('kdata_base')
@@ -916,7 +1031,7 @@ def mmap_self_fix_2_start():
     return trace[j].rip - kdata_base
 
 @derive_symbol
-@retry_on_error
+@optional
 def mmap_self_fix_1_start():
     use_r0gdb_trace(16777216)
     kdata_base = gdb.ieval('kdata_base')
@@ -990,20 +1105,16 @@ def mdbg_call_fix():
 )
 @retry_on_error
 def sceSblServiceMailbox():
-    # we need about 20 MB of log memory, allocate 64 MB just to be sure
-    use_r0gdb_trace(1<<26)
+    # 256 MB - make sure its divisible by 8*21, if the buffer fills up and the last entry isnt complete then the Trace ctor fails
+    # even 512MB fills up but since all mailbox calls happen in the first ~100MB it should be fine...?
+    use_r0gdb_trace((1<<28) - ((1<<28) % (8*21))) 
     kdata_base = gdb.ieval('kdata_base')
-    # fill mmap_self offsets, 'coz we're tracing mmap_self for simplicity
-    gdb.ieval('offsets.mmap_self_fix_1_end = (offsets.mmap_self_fix_1_start = %s) + 2'%ostr(kdata_base+get_symbol('mmap_self_fix_1_start')))
-    gdb.ieval('offsets.mmap_self_fix_2_end = (offsets.mmap_self_fix_2_start = %s) + 2'%ostr(kdata_base+get_symbol('mmap_self_fix_2_start')))
-    # open some library
-    fd = gdb.ieval('(int)open("/system_ex/common_ex/lib/libSceNKWebKit.sprx", 0)')
-    assert fd >= 0
-    # now mmap and mlock first 64 KB of the first segment
-    trace = traces.Trace(
-        r0gdb.trace('fix_mmap_self', 'mmap', 0, 65536, 1, 0x80001, fd, 0) +
-        r0gdb.trace('fix_mmap_self', 'mlock', gdb.ieval('(void*)$rax'), 65536)
-    )
+    trace_bin = r0gdb.trace('trace_skip_scheduler_only', 'dynlib_load_prx', '"/system/common/lib/libSceDepth.sprx"', 0, 'malloc(4)', 0)
+    # with open('trace_sceSblServiceMailbox_kdata_0x%x.bin'%(kdata_base,), 'wb') as f:
+    #     f.write(trace_bin)
+    trace = traces.Trace(trace_bin)
+
+    print('searching for sceSblServiceMailbox...')
     # filter callers for each function being called
     lrs = collections.defaultdict(list)
     for i in range(1, len(trace)):
@@ -1014,25 +1125,41 @@ def sceSblServiceMailbox():
     # * verifyHeader
     # * sceSblAuthMgrSmIsLoadable2
     # * loadSelfSegment
-    # * decryptSelfBlock (4 times in a row)
-    candidates = [i for i, j in lrs.items() if len(j) in (7, 8) and len(set(j)) == len(j) - 3 and len(set(j[-4:])) == 1]
+    # * decryptSelfBlock (3 times in a row)
+    # * loadSelfSegment
+    # * decryptSelfBlock
+    candidates = [
+        i for i, j in lrs.items()
+        if len(j) in (8, 9) # 8 or 9 total calls
+        and len(set(j)) in (4, 5) # 4 or 5 unique callers
+    ]
     assert candidates
     # the real mailbox call has rsi = rdx for all invocations. filter by that
-    mailbox = [i for i in candidates if all(j.rsi == j.rdx for j in trace if j.rip == i)]
+    # all calls should be for authmgr, so rdi/handle should be the same for every entry
+    mailbox = []
+    for i in candidates:
+        entries = [e for e in trace if e.rip == i]
+        if not entries:
+            continue
+        if all(e.rsi == e.rdx for e in entries) and all(e.rdi == entries[0].rdi for e in entries):
+            mailbox.append(i)
     assert len(mailbox) == 1
     mailbox, = mailbox
     lrs = lrs[mailbox]
-    verifyHeader, sceSblAuthMgrSmIsLoadable2, loadSelfSegment, decryptSelfBlock = lrs[-7:-3]
+    verifyHeader, sceSblAuthMgrSmIsLoadable2, loadSelfSegment, decryptSelfBlock = lrs[-8:-4]
     # for sceSblAuthMgrSmIsLoadable2 we need the function start, not the mailbox callsite
     sceSblAuthMgrSmIsLoadable2 = trace[trace.find_caller(trace.find_next_rip(0, sceSblAuthMgrSmIsLoadable2))+1].rip
-    return (
+    res = (
         mailbox - kdata_base,
-        lrs[0] + 5 - kdata_base if len(lrs) == 8 else None,
+        lrs[0] + 5 - kdata_base if len(lrs) == 9 else None,
         verifyHeader + 5 - kdata_base,
         sceSblAuthMgrSmIsLoadable2 - kdata_base,
         loadSelfSegment + 5 - kdata_base,
         decryptSelfBlock + 5 - kdata_base,
     )
+    # double check that theyre all different
+    assert len(set(res)) == len(res)
+    return res
 
 def run_make_fself(elf_data, auth_info):
     import make_fself
