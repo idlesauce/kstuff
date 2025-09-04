@@ -888,6 +888,20 @@ def dr2gpr_start():
     cpu_switch = trace.find_next_rip(0, kdata_base + get_symbol('cpu_switch'))
     assert td == trace[cpu_switch].rdi
     mtx = trace[cpu_switch].rdx
+    # on 10.x this check:
+    # test    dword ptr [r8+100h], 2
+    # jnz     store_dr
+    
+    # changed to:
+    # test    dword ptr [r8+110h], 2
+    # jnz     store_dr
+
+    # offset of pcb_flags still appears to be 0x100, since it still holds 24
+    # the 0x110 field holds 0 by default on both 4.03 and 10.01
+    og_flags2 = gdb.ieval('{int}%d'%(pcb+0x110))
+    assert og_flags2 == 0
+    gdb.ieval('{int}%d = %d'%(pcb+0x110, og_flags2 | 2))
+
     # now trace the entirety of cpu_switch
     getpid = gdb.ieval('{void*}%d'%(kdata_base+get_symbol('sysents')+20*48+8))
     gdb.ieval('fncall_fn = '+ostr(kdata_base+get_symbol('cpu_switch')))
@@ -896,17 +910,49 @@ def dr2gpr_start():
     gdb.ieval('sys_getpid = '+ostr(getpid))
     gdb.ieval('offsets.cpu_switch = 0')
     trace2 = traces.Trace(r0gdb.trace('getpid_to_fncall', 'getpid_for_smsw_ax'))
+    gdb.ieval('{int}%d = %d'%(pcb+0x110, og_flags2))
     gdb.ieval('offsets.cpu_switch = '+ostr(kdata_base + get_symbol('cpu_switch')))
     cpu_switch = trace2.find_next_rip(0, kdata_base + get_symbol('cpu_switch'))
     # we've traced the dbreg get/set code, now find it using magic values in registers
     dr2gpr_start = j = trace2.find_next_reg(cpu_switch, 'r11', 0xffff4ff0)
     while not trace2.is_jump(dr2gpr_start-1): dr2gpr_start -= 1
-    while trace2[j].r11 == 0xffff4ff0: j += 1
-    gpr2dr_1_start = trace2.find_next_reg(j, 'r11', 0xffff4ff0)
-    while trace2[gpr2dr_1_start].rcx != 0x400: gpr2dr_1_start += 1
+    dr2gpr_start = trace2[dr2gpr_start].rip
+    assert len(trace2.find_rip_all(dr2gpr_start)) == 1
+    # dr0-dr3 should all be 0, theyre loaded into r15, r14, r13, rbx
+    # dr7 should be 0x400, held in rax
+    # dr6 should be 0xffff4ff0, held in r11
+    # load_dr:
+    #     mov     rax, dr7
+    #     mov     r15, [r8+78h]
+    #     mov     r14, [r8+80h]
+    #     mov     r13, [r8+88h]
+    #     mov     rbx, [r8+90h]
+    #     mov     r11, [r8+98h]
+    #     mov     rcx, [r8+0A0h]
+    # 2A: mov     dr0, r15 <- what we need
+    gpr2dr_1_start_candidates = []
+    for i in range(j, len(trace2)):
+        if (trace2[i].rax != 0x400 or trace2[i].r11 != 0xffff4ff0 or
+            trace2[i].r15 != 0 or trace2[i].r14 != 0 or
+            trace2[i].r13 != 0 or trace2[i].rbx != 0):
+            continue
+
+        # 7 instructions back should be rip-2A
+        # rax probably held something different back then too
+        if trace2[i-7].rip != trace2[i].rip - 0x2A or trace2[i-7].rax == 0x400:
+            continue
+
+        # 8 instructions back should be a jmp
+        if not trace2.is_jump(i-8):
+            continue
+
+        gpr2dr_1_start_candidates.append(i)
+
+    assert len(gpr2dr_1_start_candidates) == 1
+    gpr2dr_1_start = gpr2dr_1_start_candidates[0]
+
     gpr2dr_2_start = trace2.find_next_reg(gpr2dr_1_start, 'rcx', 0xc0011024)
     while not trace2[gpr2dr_2_start].rdx: gpr2dr_2_start += 1
-    dr2gpr_start = trace2[dr2gpr_start].rip
     gpr2dr_1_start = trace2[gpr2dr_1_start].rip
     gpr2dr_2_start = trace2[gpr2dr_2_start].rip
     j = cpu_switch
@@ -1110,7 +1156,7 @@ def sceSblServiceMailbox():
     use_r0gdb_trace((1<<28) - ((1<<28) % (8*21))) 
     kdata_base = gdb.ieval('kdata_base')
     trace_bin = r0gdb.trace('trace_skip_scheduler_only', 'dynlib_load_prx', '"/system/common/lib/libSceDepth.sprx"', 0, 'malloc(4)', 0)
-    # with open('trace_sceSblServiceMailbox_kdata_0x%x.bin'%(kdata_base,), 'wb') as f:
+    # with open('trace_sceSblServiceMailbox_kdata_0x%x.bin'%(kdata_base), 'wb') as f:
     #     f.write(trace_bin)
     trace = traces.Trace(trace_bin)
 
@@ -1130,8 +1176,9 @@ def sceSblServiceMailbox():
     # * decryptSelfBlock
     candidates = [
         i for i, j in lrs.items()
-        if len(j) in (8, 9) # 8 or 9 total calls
-        and len(set(j)) in (4, 5) # 4 or 5 unique callers
+        # 8 or 9 total calls, 4 or 5 unique callers, all of which should be in order at the start
+        if (len(j) == 8 and len(set(j)) == 4 and len(set(j[0:4])) == 4)
+        or (len(j) == 9 and len(set(j)) == 5 and len(set(j[0:5])) == 5)
     ]
     assert candidates
     # the real mailbox call has rsi = rdx for all invocations. filter by that
@@ -1149,7 +1196,7 @@ def sceSblServiceMailbox():
     verifyHeader, sceSblAuthMgrSmIsLoadable2, loadSelfSegment, decryptSelfBlock = lrs[-8:-4]
     # for sceSblAuthMgrSmIsLoadable2 we need the function start, not the mailbox callsite
     sceSblAuthMgrSmIsLoadable2 = trace[trace.find_caller(trace.find_next_rip(0, sceSblAuthMgrSmIsLoadable2))+1].rip
-    res = (
+    return (
         mailbox - kdata_base,
         lrs[0] + 5 - kdata_base if len(lrs) == 9 else None,
         verifyHeader + 5 - kdata_base,
@@ -1157,9 +1204,6 @@ def sceSblServiceMailbox():
         loadSelfSegment + 5 - kdata_base,
         decryptSelfBlock + 5 - kdata_base,
     )
-    # double check that theyre all different
-    assert len(set(res)) == len(res)
-    return res
 
 def run_make_fself(elf_data, auth_info):
     import make_fself
